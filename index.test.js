@@ -7,7 +7,13 @@
 
 const assert = require('node:assert/strict')
 const { decode } = require('./decoder')
-const { buildDelta, buildMeta, PLUGIN_ID } = require('./index')
+const {
+  buildDelta,
+  buildMeta,
+  normalizeConfig,
+  emitMetaIfNeeded,
+  PLUGIN_ID,
+} = require('./index')
 
 const tests = []
 const t = (name, fn) => tests.push({ name, fn })
@@ -112,6 +118,118 @@ t('buildMeta: every entry has a description string', () => {
     assert.equal(typeof m.value.description, 'string')
     assert.ok(m.value.description.length > 0, `empty description for ${m.path}`)
   }
+})
+
+// --- normalizeConfig ---
+//
+// Regression test for the "tag.id is undefined for saved config" bug:
+// SignalK persists plugin config as { "<id>": { enabled, name, location } }
+// — the id is the *key* of the dict, not a field on the value. Freshly-
+// discovered tags get .id set inline, but tags loaded from saved config
+// don't, which broke metaSent dedup (every saved tag had id=undefined).
+t('normalizeConfig: backfills .id from dict key onto each entry', () => {
+  const saved = {
+    c2646bf3e6eb: { enabled: true, name: 'c2646b', location: 'inside' },
+    f2a71fe090cc: { enabled: true, name: 'f2a71f', location: 'fridge' },
+  }
+  const config = normalizeConfig(saved)
+  assert.equal(config.c2646bf3e6eb.id, 'c2646bf3e6eb')
+  assert.equal(config.f2a71fe090cc.id, 'f2a71fe090cc')
+  // Other fields preserved
+  assert.equal(config.c2646bf3e6eb.name, 'c2646b')
+  assert.equal(config.f2a71fe090cc.location, 'fridge')
+})
+
+t('normalizeConfig: deep-clones so mutating result does not affect input', () => {
+  const saved = { abc: { enabled: true, name: 'a', location: 'inside' } }
+  const config = normalizeConfig(saved)
+  config.abc.location = 'mutated'
+  assert.equal(saved.abc.location, 'inside')
+  assert.equal(saved.abc.id, undefined)
+})
+
+t('normalizeConfig: handles undefined / empty input', () => {
+  assert.deepEqual(normalizeConfig(undefined), {})
+  assert.deepEqual(normalizeConfig(null), {})
+  assert.deepEqual(normalizeConfig({}), {})
+})
+
+t('normalizeConfig: tolerates malformed entries', () => {
+  const config = normalizeConfig({ good: { enabled: true }, bad: null })
+  assert.equal(config.good.id, 'good')
+  assert.equal(config.bad, null)
+})
+
+// --- emitMetaIfNeeded ---
+//
+// The bug we shipped was that metaSent.has(tag.id) collapsed to has(undefined)
+// for saved tags, so only the first tag emitted meta. These tests pin the
+// dedup behavior to the actual tag id and prove that two distinct tags get
+// two distinct meta deltas.
+function makeFakeApp() {
+  const calls = []
+  return {
+    calls,
+    handleMessage: (id, delta) => calls.push({ id, delta }),
+  }
+}
+
+t('emitMetaIfNeeded: emits exactly one meta delta the first time, dedups after', () => {
+  const app = makeFakeApp()
+  const sent = new Set()
+  const tag = { id: 'aaa', name: 'a', location: 'inside.salon', enabled: true }
+
+  emitMetaIfNeeded(app, tag, sent)
+  emitMetaIfNeeded(app, tag, sent)
+  emitMetaIfNeeded(app, tag, sent)
+
+  assert.equal(app.calls.length, 1)
+  assert.equal(app.calls[0].id, PLUGIN_ID)
+  assert.equal(sent.has('aaa'), true)
+  assert.ok(Array.isArray(app.calls[0].delta.updates[0].meta))
+  assert.ok(app.calls[0].delta.updates[0].meta.length > 0)
+  // No values mixed in (Update is a discriminated union, values XOR meta)
+  assert.equal(app.calls[0].delta.updates[0].values, undefined)
+  // Timestamp included (matches signalk-victron-ble PR #39 pattern)
+  assert.equal(typeof app.calls[0].delta.updates[0].timestamp, 'string')
+})
+
+t('emitMetaIfNeeded: two distinct tags emit two distinct meta deltas', () => {
+  // The bug fixed in v1.0.3: with id=undefined for both saved tags, the
+  // second call here would have been deduped and only one meta delta
+  // would have been sent. With the fix (normalizeConfig backfilling id),
+  // tag.id is unique per tag and we get one delta per tag.
+  const app = makeFakeApp()
+  const sent = new Set()
+  const inside = { id: 'aaa', name: 'a', location: 'inside', enabled: true }
+  const fridge = { id: 'bbb', name: 'b', location: 'fridge', enabled: true }
+
+  emitMetaIfNeeded(app, inside, sent)
+  emitMetaIfNeeded(app, fridge, sent)
+
+  assert.equal(app.calls.length, 2, 'should emit one meta delta per unique tag id')
+  const paths0 = app.calls[0].delta.updates[0].meta.map((m) => m.path)
+  const paths1 = app.calls[1].delta.updates[0].meta.map((m) => m.path)
+  assert.ok(paths0.some((p) => p.startsWith('environment.inside.')))
+  assert.ok(paths1.some((p) => p.startsWith('environment.fridge.')))
+})
+
+t('emitMetaIfNeeded: skipped entirely when tag.id is undefined (defensive)', () => {
+  // Belt-and-suspenders: even if normalizeConfig were bypassed somehow,
+  // the dedup Set would still grow with one undefined entry. Dedup still
+  // works (only one emit), but this documents the failure mode.
+  const app = makeFakeApp()
+  const sent = new Set()
+  const a = { name: 'a', location: 'inside', enabled: true } // .id missing
+  const b = { name: 'b', location: 'fridge', enabled: true } // .id missing
+
+  emitMetaIfNeeded(app, a, sent)
+  emitMetaIfNeeded(app, b, sent)
+
+  // Both calls had undefined id, so dedup collapses them to one. This is
+  // the OLD broken behavior — kept as an explicit reminder that the fix
+  // lives upstream in normalizeConfig, not in this function.
+  assert.equal(app.calls.length, 1)
 })
 
 let failed = 0

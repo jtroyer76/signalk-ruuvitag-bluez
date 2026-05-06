@@ -46,7 +46,7 @@ module.exports = function (app) {
   const errorLog = typeof app.error === 'function' ? app.error.bind(app) : console.error
 
   const start = async (initialConfig) => {
-    config = JSON.parse(JSON.stringify(initialConfig || {}))
+    config = normalizeConfig(initialConfig)
     adsSeen = 0
     adsDelivered = 0
     metaSent = new Set()
@@ -77,25 +77,13 @@ module.exports = function (app) {
       const tag = config[id]
       if (!tag.enabled) return
 
-      // Emit metadata once per tag, as its own meta-only delta. The
-      // SignalK Update type is a discriminated union — an update has
-      // either `values` OR `meta`, not both:
-      //   ({ values: PathValue[] } | { meta: Meta[] })
-      // Mixing them in one update is accepted by the handler but only
-      // the values branch gets persisted, so meta-only updates are the
-      // correct way to populate the meta tree.
-      if (!metaSent.has(tag.id)) {
-        app.handleMessage(PLUGIN_ID, {
-          updates: [
-            {
-              $source: `${PLUGIN_ID}.${tag.name}`,
-              meta: buildMeta(tag),
-            },
-          ],
-        })
-        metaSent.add(tag.id)
-      }
-
+      // Emit metadata once per tag as its own meta-only delta. The
+      // SignalK Update type is a discriminated union — values XOR meta —
+      // and the spec requires meta be sent before values for new leaves.
+      // Includes timestamp explicitly because the server's processing
+      // path expects it on meta deltas (matches the pattern in
+      // stefanor/signalk-victron-ble PR #39).
+      emitMetaIfNeeded(app, tag, metaSent)
       app.handleMessage(PLUGIN_ID, buildDelta(tag, decoded, rssi))
       adsDelivered++
     })
@@ -194,6 +182,36 @@ module.exports = function (app) {
     start,
     stop,
   }
+}
+
+// SignalK persists plugin config as { "<id>": { enabled, name, location } }
+// — the id is the dict key, not a field on the entry. Freshly-discovered
+// tags are added with id inline; tags loaded from saved config aren't.
+// Backfilling here means every code path can trust tag.id is set, which
+// matters for things like the metaSent dedup keyed on tag.id (without
+// this, two saved tags would collapse to one undefined key).
+function normalizeConfig(initialConfig) {
+  const config = JSON.parse(JSON.stringify(initialConfig || {}))
+  for (const [id, tag] of Object.entries(config)) {
+    if (tag && typeof tag === 'object') tag.id = id
+  }
+  return config
+}
+
+// Send the meta-only delta for this tag once per plugin lifetime. Using
+// a mutable Set means a config change (which triggers stop/start) gets
+// us a fresh empty Set and re-emits, picking up any rename/relocation.
+function emitMetaIfNeeded(app, tag, metaSent) {
+  if (metaSent.has(tag.id)) return
+  app.handleMessage(PLUGIN_ID, {
+    updates: [
+      {
+        timestamp: new Date().toISOString(),
+        meta: buildMeta(tag),
+      },
+    ],
+  })
+  metaSent.add(tag.id)
 }
 
 // Metadata declared on the first delta we deliver for each tag. Tells
@@ -304,4 +322,6 @@ function round(n, digits) {
 // Internal — exposed for tests only.
 module.exports.buildDelta = buildDelta
 module.exports.buildMeta = buildMeta
+module.exports.normalizeConfig = normalizeConfig
+module.exports.emitMetaIfNeeded = emitMetaIfNeeded
 module.exports.PLUGIN_ID = PLUGIN_ID
