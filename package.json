@@ -1,6 +1,6 @@
 {
   "name": "signalk-ruuvitag-bluez",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "SignalK plugin: RuuviTag environmental data via BlueZ over DBus. Drop-in replacement for signalk-ruuvitag-plugin without noble, raw HCI sockets, setcap, or privileged Docker.",
   "main": "index.js",
   "scripts": {
