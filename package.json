@@ -1,0 +1,42 @@
+{
+  "name": "signalk-ruuvitag-bluez",
+  "version": "0.1.0",
+  "description": "SignalK plugin: RuuviTag environmental data via BlueZ over DBus. Drop-in replacement for signalk-ruuvitag-plugin without noble, raw HCI sockets, setcap, or privileged Docker.",
+  "main": "index.js",
+  "scripts": {
+    "test": "node decoder.test.js && node index.test.js"
+  },
+  "keywords": [
+    "signalk",
+    "signalk-node-server-plugin",
+    "signalk-plugin",
+    "ruuvi",
+    "ruuvitag",
+    "bluez",
+    "dbus",
+    "ble"
+  ],
+  "license": "MIT",
+  "author": "Jess Troyer <jtroyer@gmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jtroyer76/signalk-ruuvitag-bluez.git"
+  },
+  "bugs": {
+    "url": "https://github.com/jtroyer76/signalk-ruuvitag-bluez/issues"
+  },
+  "homepage": "https://github.com/jtroyer76/signalk-ruuvitag-bluez#readme",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "dbus-next": "^0.10.2"
+  },
+  "files": [
+    "index.js",
+    "scanner.js",
+    "decoder.js",
+    "README.md",
+    "LICENSE"
+  ]
+}
