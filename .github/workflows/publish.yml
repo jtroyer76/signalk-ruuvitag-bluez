@@ -1,15 +1,15 @@
 name: publish
 
 on:
-  release:
-    types: [published]
+  push:
+    tags: ['v*']
 
 jobs:
   publish:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
-      id-token: write   # required for npm trusted publishing (OIDC) + provenance
+      contents: write   # to create the GitHub Release after publishing
+      id-token: write   # for npm trusted publishing (OIDC) + provenance
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
@@ -24,3 +24,8 @@ jobs:
       - run: npm ci
       - run: npm test
       - run: npm publish --access public
+      # Create a GitHub Release with auto-generated notes (commits + PRs
+      # since the previous tag) only after the npm publish succeeded.
+      - run: gh release create "$GITHUB_REF_NAME" --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}
