@@ -77,12 +77,26 @@ module.exports = function (app) {
       const tag = config[id]
       if (!tag.enabled) return
 
-      const delta = buildDelta(tag, decoded, rssi)
+      // Emit metadata once per tag, as its own meta-only delta. The
+      // SignalK Update type is a discriminated union — an update has
+      // either `values` OR `meta`, not both:
+      //   ({ values: PathValue[] } | { meta: Meta[] })
+      // Mixing them in one update is accepted by the handler but only
+      // the values branch gets persisted, so meta-only updates are the
+      // correct way to populate the meta tree.
       if (!metaSent.has(tag.id)) {
-        delta.updates[0].meta = buildMeta(tag)
+        app.handleMessage(PLUGIN_ID, {
+          updates: [
+            {
+              $source: `${PLUGIN_ID}.${tag.name}`,
+              meta: buildMeta(tag),
+            },
+          ],
+        })
         metaSent.add(tag.id)
       }
-      app.handleMessage(PLUGIN_ID, delta)
+
+      app.handleMessage(PLUGIN_ID, buildDelta(tag, decoded, rssi))
       adsDelivered++
     })
 
