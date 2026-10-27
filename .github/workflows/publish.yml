@@ -19,8 +19,9 @@ jobs:
           cache: npm
       # npm 11.5.1+ is required for trusted publishing. Node 20 ships with
       # npm 10.x, so upgrade before publishing. Provenance is automatic
-      # under trusted publishing — no flag needed.
-      - run: npm install -g npm@latest
+      # under trusted publishing — no flag needed. Pinned to 11: npm 12
+      # requires Node >=22.22.2 and fails EBADENGINE on Node 20.
+      - run: npm install -g npm@11
       - run: npm ci
       - run: npm test
       - run: npm publish --access public
