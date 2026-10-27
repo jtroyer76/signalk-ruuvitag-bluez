@@ -4,7 +4,7 @@
   "description": "SignalK plugin: RuuviTag environmental data via BlueZ over DBus. Drop-in replacement for signalk-ruuvitag-plugin without noble, raw HCI sockets, setcap, or privileged Docker.",
   "main": "index.js",
   "scripts": {
-    "test": "node decoder.test.js && node index.test.js"
+    "test": "node decoder.test.js && node index.test.js && node scanner.test.js"
   },
   "keywords": [
     "signalk",

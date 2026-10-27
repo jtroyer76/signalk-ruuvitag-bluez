@@ -51,7 +51,15 @@ class BluezScanner extends EventEmitter {
     this.adapterPath = null
     this.objectManager = null
     this.devices = new Map() // path -> { address, name, rssi, manufacturerData }
+    // path -> { propsIface, handler } (propsIface null while the proxy is
+    // still being fetched). dbus-next's getProxyObject() returns a fresh
+    // proxy every call and every .on() adds another listener on the shared
+    // bus, so watching a path twice doubles every advertisement. BlueZ
+    // drops and re-adds device objects as they go stale, so without this
+    // map listeners pile up for the life of the plugin.
+    this.watchers = new Map()
     this._addedHandler = null
+    this._removedHandler = null
   }
 
   async start() {
@@ -102,6 +110,13 @@ class BluezScanner extends EventEmitter {
     }
     this.objectManager.on('InterfacesAdded', this._addedHandler)
 
+    this._removedHandler = (path, ifaces) => {
+      if (!ifaces.includes('org.bluez.Device1')) return
+      this._unwatch(path)
+      this.devices.delete(path)
+    }
+    this.objectManager.on('InterfacesRemoved', this._removedHandler)
+
     for (const [path, ifaces] of Object.entries(objects)) {
       if (!ifaces['org.bluez.Device1']) continue
       const props = unwrapAll(ifaces['org.bluez.Device1'])
@@ -132,6 +147,10 @@ class BluezScanner extends EventEmitter {
     if (this.objectManager && this._addedHandler) {
       this.objectManager.off('InterfacesAdded', this._addedHandler)
     }
+    if (this.objectManager && this._removedHandler) {
+      this.objectManager.off('InterfacesRemoved', this._removedHandler)
+    }
+    for (const path of [...this.watchers.keys()]) this._unwatch(path)
     try { this.bus.disconnect() } catch (e) { /* ignore */ }
     this.bus = null
     this.adapter = null
@@ -151,10 +170,17 @@ class BluezScanner extends EventEmitter {
   }
 
   async _watch(path) {
+    if (this.watchers.has(path)) return
+    // Claim the path before awaiting so a concurrent InterfacesAdded for
+    // the same path (startup race) can't register a second listener.
+    const entry = { propsIface: null, handler: null }
+    this.watchers.set(path, entry)
     try {
       const obj = await this.bus.getProxyObject('org.bluez', path)
+      if (this.watchers.get(path) !== entry) return // removed while awaiting
       const propsIface = obj.getInterface('org.freedesktop.DBus.Properties')
-      propsIface.on('PropertiesChanged', (iface, changed) => {
+      entry.propsIface = propsIface
+      entry.handler = (iface, changed) => {
         if (iface !== 'org.bluez.Device1') return
         const u = unwrapAll(changed)
         if (u.ManufacturerData !== undefined) {
@@ -164,9 +190,20 @@ class BluezScanner extends EventEmitter {
         // Only emit on advertisements that carry fresh manufacturer data
         // (RSSI-only updates are noise here — the decoder needs payload).
         if (u.ManufacturerData !== undefined) this._maybeEmit(state)
-      })
+      }
+      propsIface.on('PropertiesChanged', entry.handler)
     } catch (e) {
+      if (this.watchers.get(path) === entry) this.watchers.delete(path)
       this.logger.debug(`watch(${path}) failed: ${e.message}`)
+    }
+  }
+
+  _unwatch(path) {
+    const entry = this.watchers.get(path)
+    if (!entry) return
+    this.watchers.delete(path)
+    if (entry.propsIface && entry.handler) {
+      entry.propsIface.off('PropertiesChanged', entry.handler)
     }
   }
 
