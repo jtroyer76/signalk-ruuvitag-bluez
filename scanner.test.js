@@ -140,6 +140,18 @@ t('a drop after establish schedules one reconnect; stop() cancels it', async () 
   assert.equal(s.reconnectTimer, null)
 })
 
+t('_teardown forgets watchers so the next bus watches every path again', async () => {
+  const s = scannerWithBus()
+  await s._watch(PATH)
+  s.bus.disconnect = () => {}
+  await s._teardown()
+  assert.equal(s.watchers.size, 0)
+
+  s.bus = fakeBus()
+  await s._watch(PATH)
+  assert.equal(s.bus.listeners(PATH), 1)
+})
+
 let failed = 0
 ;(async () => {
   for (const { name, fn } of tests) {
