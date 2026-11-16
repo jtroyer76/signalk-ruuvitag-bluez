@@ -46,6 +46,72 @@ const mfgChange = () => ({
   ManufacturerData: { value: { [RUUVI]: { value: [5, 1, 2, 3] } } },
 })
 
+const ADAPTER = '/org/bluez/hci0'
+
+// A system bus that _establish() can run against end to end. Device paths
+// delegate to fakeBus() so PropertiesChanged fan-out behaves the same.
+// `gate`, if given, holds GetManagedObjects() until it resolves, leaving
+// an _establish() suspended mid-flight.
+function fakeSystemBus({ gate } = {}) {
+  const devices = fakeBus()
+  const bus = new EventEmitter()
+  const objectManager = new EventEmitter()
+  bus.objectManager = objectManager
+  bus.startDiscoveryCalls = 0
+  bus.disconnected = false
+  const omIface = {
+    on: (ev, fn) => objectManager.on(ev, fn),
+    off: (ev, fn) => objectManager.off(ev, fn),
+    GetManagedObjects: async () => {
+      if (gate) await gate
+      return { [ADAPTER]: { 'org.bluez.Adapter1': {} } }
+    },
+  }
+  const adapterIface = {
+    SetDiscoveryFilter: async () => {},
+    StartDiscovery: async () => { bus.startDiscoveryCalls++ },
+    StopDiscovery: async () => {},
+  }
+  const adapterProps = { Get: async () => ({ value: true }), Set: async () => {} }
+  bus.getProxyObject = async (name, path) => {
+    if (path === '/') return { getInterface: () => omIface }
+    if (path === ADAPTER) {
+      return { getInterface: (i) => (i === 'org.bluez.Adapter1' ? adapterIface : adapterProps) }
+    }
+    return devices.getProxyObject(name, path)
+  }
+  bus.disconnect = () => { bus.disconnected = true }
+  bus.devices = devices
+  return bus
+}
+
+// scanner.js calls dbus.systemBus() through the module object, so replacing
+// it here hands each _establish() the next queued fake.
+const dbus = require('dbus-next')
+const busQueue = []
+dbus.systemBus = () => {
+  if (!busQueue.length) throw new Error('test did not queue a fake bus')
+  return busQueue.shift()
+}
+
+const silentLogger = () => {
+  const log = { debug: [], info: [], error: [] }
+  return {
+    log,
+    logger: {
+      debug: (m) => log.debug.push(m),
+      info: (m) => log.info.push(m),
+      error: (m) => log.error.push(m),
+    },
+  }
+}
+
+const deferred = () => {
+  let resolve
+  const promise = new Promise((r) => { resolve = r })
+  return { promise, resolve }
+}
+
 const tests = []
 const t = (name, fn) => tests.push({ name, fn })
 
@@ -150,6 +216,26 @@ t('_teardown forgets watchers so the next bus watches every path again', async (
   s.bus = fakeBus()
   await s._watch(PATH)
   assert.equal(s.bus.listeners(PATH), 1)
+})
+
+t('a late error from a replaced bus does not tear down the live one', async () => {
+  const { logger } = silentLogger()
+  const s = new BluezScanner({ manufacturerId: RUUVI, logger })
+  const oldBus = fakeSystemBus()
+  const newBus = fakeSystemBus()
+  busQueue.push(oldBus, newBus)
+  await s.start()
+  await s.stop()
+  await s.start()
+  assert.equal(s.bus, newBus)
+
+  oldBus.emit('error', new Error('late error from disconnected bus'))
+  await new Promise((r) => setImmediate(r))
+  assert.equal(s.reconnecting, false)
+  assert.equal(s.established, true)
+  assert.equal(s.bus, newBus)
+  assert.equal(newBus.disconnected, false)
+  await s.stop()
 })
 
 let failed = 0

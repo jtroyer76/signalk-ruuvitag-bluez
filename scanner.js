@@ -109,12 +109,19 @@ class BluezScanner extends EventEmitter {
   }
 
   async _establish() {
-    this.bus = dbus.systemBus()
+    const bus = dbus.systemBus()
+    this.bus = bus
 
     // Attach before any awaits: an unhandled 'error' on the bus EventEmitter
     // would otherwise throw and take down the server. Kept on the bus object
-    // for its whole life; guards in _handleDrop make stale invocations no-ops.
+    // for its whole life. dbus-next keeps emitting 'error' on a bus after
+    // disconnect(), so an error from a bus that has since been replaced must
+    // not tear down the current one.
     this._busErrorHandler = (err) => {
+      if (bus !== this.bus) {
+        this.logger.debug(`dbus error on replaced connection: ${err.message}`)
+        return
+      }
       this.logger.error(`dbus error: ${err.message}`)
       this._handleDrop('dbus connection error')
     }
