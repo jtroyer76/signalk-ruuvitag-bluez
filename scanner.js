@@ -123,7 +123,7 @@ class BluezScanner extends EventEmitter {
         return
       }
       this.logger.error(`dbus error: ${err.message}`)
-      this._handleDrop('dbus connection error')
+      this._handleDrop('BlueZ connection lost (dbus connection error); reconnecting')
     }
     this.bus.on('error', this._busErrorHandler)
 
@@ -227,11 +227,11 @@ class BluezScanner extends EventEmitter {
   // connection down and enter the reconnect loop. Guarded so overlapping
   // triggers (bus error + liveness timeout) and stale old-bus errors during
   // a reconnect don't stack loops.
-  async _handleDrop(reason) {
+  async _handleDrop(message, level = 'error') {
     if (!this.running || this.reconnecting || !this.established) return
     this.reconnecting = true
     this.established = false
-    this.logger.error(`BlueZ connection lost (${reason}); reconnecting`)
+    this.logger[level](message)
     this.reconnectDelay = RECONNECT_BASE_MS
     await this._teardown()
     this._scheduleReconnect()
@@ -307,10 +307,18 @@ class BluezScanner extends EventEmitter {
   _resetLiveness() {
     if (this.livenessTimer) clearTimeout(this.livenessTimer)
     if (!this.running) return
-    this.livenessTimer = setTimeout(() => {
-      this._handleDrop(`no advertisements for ${LIVENESS_TIMEOUT_MS / 1000}s`)
-    }, LIVENESS_TIMEOUT_MS)
+    this.livenessTimer = setTimeout(() => this._onLivenessTimeout(), LIVENESS_TIMEOUT_MS)
     if (this.livenessTimer.unref) this.livenessTimer.unref()
+  }
+
+  // Silence is ambiguous: a stalled discovery looks the same as every tag
+  // being out of range, asleep or on a flat battery, so this is not logged
+  // as a connection failure.
+  _onLivenessTimeout() {
+    return this._handleDrop(
+      `no advertisements for ${LIVENESS_TIMEOUT_MS / 1000}s; restarting discovery`,
+      'info',
+    )
   }
 
   _update(path, props) {

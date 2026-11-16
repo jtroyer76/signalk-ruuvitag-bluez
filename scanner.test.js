@@ -262,6 +262,17 @@ t('stop()/start() during an in-flight _establish leaves one run on the new bus',
   await s.stop()
 })
 
+t('liveness timeout on quiet tags logs at info, not error', async () => {
+  const { log, logger } = silentLogger()
+  const s = new BluezScanner({ manufacturerId: RUUVI, logger })
+  s.running = true
+  s.established = true
+  await s._onLivenessTimeout()
+  assert.equal(log.error.length, 0)
+  assert.match(log.info.join('\n'), /no advertisements for 60s; restarting discovery/)
+  await s.stop()
+})
+
 let failed = 0
 ;(async () => {
   for (const { name, fn } of tests) {
