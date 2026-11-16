@@ -238,6 +238,30 @@ t('a late error from a replaced bus does not tear down the live one', async () =
   await s.stop()
 })
 
+t('stop()/start() during an in-flight _establish leaves one run on the new bus', async () => {
+  const { logger } = silentLogger()
+  const s = new BluezScanner({ manufacturerId: RUUVI, logger })
+  const gate = deferred()
+  const staleBus = fakeSystemBus({ gate: gate.promise })
+  const liveBus = fakeSystemBus()
+  busQueue.push(staleBus, liveBus)
+
+  const staleRun = s._establish()
+  await new Promise((r) => setImmediate(r)) // suspended in GetManagedObjects
+  await s.stop()
+  await s.start()
+  gate.resolve()
+  await staleRun
+
+  assert.equal(s.bus, liveBus)
+  assert.equal(s.established, true)
+  assert.equal(liveBus.objectManager.listenerCount('InterfacesAdded'), 1)
+  assert.equal(liveBus.objectManager.listenerCount('InterfacesRemoved'), 1)
+  assert.equal(staleBus.startDiscoveryCalls, 0)
+  assert.equal(liveBus.startDiscoveryCalls, 1)
+  await s.stop()
+})
+
 let failed = 0
 ;(async () => {
   for (const { name, fn } of tests) {

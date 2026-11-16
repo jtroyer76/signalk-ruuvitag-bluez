@@ -127,37 +127,57 @@ class BluezScanner extends EventEmitter {
     }
     this.bus.on('error', this._busErrorHandler)
 
-    const bluez = await this.bus.getProxyObject('org.bluez', '/')
-    this.objectManager = bluez.getInterface('org.freedesktop.DBus.ObjectManager')
-
-    const objects = await this.objectManager.GetManagedObjects()
-
-    for (const [path, ifaces] of Object.entries(objects)) {
-      if (ifaces['org.bluez.Adapter1']) {
-        this.adapterPath = path
-        break
-      }
+    try {
+      return await this._connect(bus)
+    } catch (e) {
+      // A run that stop()/start() superseded fails against its disconnected
+      // bus; its error belongs to nobody and must not tear down the new run.
+      if (bus !== this.bus) return false
+      throw e
     }
-    if (!this.adapterPath) {
+  }
+
+  // Bring `bus` up to an active discovery session. Returns false, leaving all
+  // state alone, if stop()/start() replaced `bus` while an await was pending
+  // (Signal K restarts plugins on config save, possibly mid-reconnect).
+  async _connect(bus) {
+    const superseded = () => bus !== this.bus
+
+    const bluez = await bus.getProxyObject('org.bluez', '/')
+    if (superseded()) return false
+    const objectManager = bluez.getInterface('org.freedesktop.DBus.ObjectManager')
+    this.objectManager = objectManager
+
+    const objects = await objectManager.GetManagedObjects()
+    if (superseded()) return false
+
+    const adapterPath = Object.keys(objects).find((path) => objects[path]['org.bluez.Adapter1'])
+    if (!adapterPath) {
       throw new Error('No BlueZ adapter found. Is bluetoothd running?')
     }
+    this.adapterPath = adapterPath
 
-    const adapterObj = await this.bus.getProxyObject('org.bluez', this.adapterPath)
-    this.adapter = adapterObj.getInterface('org.bluez.Adapter1')
+    const adapterObj = await bus.getProxyObject('org.bluez', adapterPath)
+    if (superseded()) return false
+    const adapter = adapterObj.getInterface('org.bluez.Adapter1')
+    this.adapter = adapter
     const adapterProps = adapterObj.getInterface('org.freedesktop.DBus.Properties')
 
     const powered = await adapterProps.Get('org.bluez.Adapter1', 'Powered')
+    if (superseded()) return false
     if (!unwrap(powered)) {
       this.logger.info('BlueZ adapter not powered, powering on')
       await adapterProps.Set('org.bluez.Adapter1', 'Powered', new Variant('b', true))
+      if (superseded()) return false
     }
 
     // DuplicateData=true: BlueZ emits a fresh PropertiesChanged for every
     // advertisement instead of deduplicating per-device.
-    await this.adapter.SetDiscoveryFilter({
+    await adapter.SetDiscoveryFilter({
       Transport: new Variant('s', 'le'),
       DuplicateData: new Variant('b', true),
     })
+    if (superseded()) return false
 
     this._addedHandler = async (path, ifaces) => {
       const dev = ifaces['org.bluez.Device1']
@@ -170,14 +190,14 @@ class BluezScanner extends EventEmitter {
       this._maybeEmit(state)
       await this._watch(path)
     }
-    this.objectManager.on('InterfacesAdded', this._addedHandler)
+    objectManager.on('InterfacesAdded', this._addedHandler)
 
     this._removedHandler = (path, ifaces) => {
       if (!ifaces.includes('org.bluez.Device1')) return
       this._unwatch(path)
       this.devices.delete(path)
     }
-    this.objectManager.on('InterfacesRemoved', this._removedHandler)
+    objectManager.on('InterfacesRemoved', this._removedHandler)
 
     for (const [path, ifaces] of Object.entries(objects)) {
       if (!ifaces['org.bluez.Device1']) continue
@@ -187,17 +207,20 @@ class BluezScanner extends EventEmitter {
       }
       this._update(path, props)
       await this._watch(path)
+      if (superseded()) return false
     }
 
     try {
-      await this.adapter.StartDiscovery()
+      await adapter.StartDiscovery()
     } catch (e) {
       if (!/AlreadyExists|InProgress/i.test(e.message || '')) throw e
       this.logger.info('Discovery already running (another DBus client owns it) - continuing')
     }
+    if (superseded()) return false
 
     this.established = true
-    this.emit('started', { adapterPath: this.adapterPath })
+    this.emit('started', { adapterPath })
+    return true
   }
 
   // A connection drop or discovery stall was detected. Tear the current
@@ -227,7 +250,8 @@ class BluezScanner extends EventEmitter {
         return
       }
       try {
-        await this._establish()
+        // Superseded by stop()/start(): the new run owns the state now.
+        if (!(await this._establish())) return
         this.reconnectDelay = RECONNECT_BASE_MS
         this.reconnecting = false
         this.logger.info('reconnected to BlueZ')
