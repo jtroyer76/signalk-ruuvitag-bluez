@@ -26,7 +26,7 @@
 
 const EventEmitter = require('node:events')
 const dbus = require('dbus-next')
-const { Variant } = dbus
+const { Variant, Message, MessageType } = dbus
 
 const RECONNECT_BASE_MS = 1_000
 const RECONNECT_MAX_MS = 30_000
@@ -35,6 +35,15 @@ const RECONNECT_MAX_MS = 30_000
 // and reconnect. Armed on the first sighting so an install with no tags in
 // range doesn't reconnect in a loop.
 const LIVENESS_TIMEOUT_MS = 60_000
+
+// One subscription for every device's PropertiesChanged, routed by object
+// path in _onMessage(). Per-device proxies would add one D-Bus match rule
+// per device, and dbus-next 0.10.2 never sends RemoveMatch (swapped
+// hasOwnProperty args in bus.js), so every BlueZ remove/re-add leaked a
+// rule until the bus's max_match_rules_per_connection (2048) was hit.
+const PROPS_MATCH_RULE =
+  "type='signal',sender='org.bluez',interface='org.freedesktop.DBus.Properties'," +
+  "member='PropertiesChanged',path_namespace='/org/bluez'"
 
 const nextReconnectDelay = (current) => Math.min(current * 2, RECONNECT_MAX_MS)
 
@@ -68,14 +77,8 @@ class BluezScanner extends EventEmitter {
     this.adapterPath = null
     this.objectManager = null
     this.devices = new Map() // path -> { address, name, rssi, manufacturerData }
-    // path -> { propsIface, handler } (propsIface null while the proxy is
-    // still being fetched). dbus-next's getProxyObject() returns a fresh
-    // proxy every call and every .on() adds another listener on the shared
-    // bus, so watching a path twice doubles every advertisement. BlueZ
-    // drops and re-adds device objects as they go stale, so without this
-    // map listeners pile up for the life of the plugin.
-    this.watchers = new Map()
     this._addedHandler = null
+    this._messageHandler = null
     this._removedHandler = null
     this._busErrorHandler = null
     // Supervision state.
@@ -182,7 +185,19 @@ class BluezScanner extends EventEmitter {
     })
     if (superseded()) return false
 
-    this._addedHandler = async (path, ifaces) => {
+    await bus.call(new Message({
+      destination: 'org.freedesktop.DBus',
+      path: '/org/freedesktop/DBus',
+      interface: 'org.freedesktop.DBus',
+      member: 'AddMatch',
+      signature: 's',
+      body: [PROPS_MATCH_RULE],
+    }))
+    if (superseded()) return false
+    this._messageHandler = (msg) => this._onMessage(msg)
+    bus.on('message', this._messageHandler)
+
+    this._addedHandler = (path, ifaces) => {
       const dev = ifaces['org.bluez.Device1']
       if (!dev) return
       const props = unwrapAll(dev)
@@ -191,13 +206,11 @@ class BluezScanner extends EventEmitter {
       }
       const state = this._update(path, props)
       this._maybeEmit(state)
-      await this._watch(path)
     }
     objectManager.on('InterfacesAdded', this._addedHandler)
 
     this._removedHandler = (path, ifaces) => {
       if (!ifaces.includes('org.bluez.Device1')) return
-      this._unwatch(path)
       this.devices.delete(path)
     }
     objectManager.on('InterfacesRemoved', this._removedHandler)
@@ -209,8 +222,6 @@ class BluezScanner extends EventEmitter {
         props.ManufacturerData = unwrapMfgData(props.ManufacturerData)
       }
       this._update(path, props)
-      await this._watch(path)
-      if (superseded()) return false
     }
 
     try {
@@ -290,9 +301,8 @@ class BluezScanner extends EventEmitter {
       if (this.objectManager && this._removedHandler) {
         try { this.objectManager.off('InterfacesRemoved', this._removedHandler) } catch (e) { /* ignore */ }
       }
-      for (const path of [...this.watchers.keys()]) {
-        try { this._unwatch(path) } catch (e) { /* ignore */ }
-      }
+      // No RemoveMatch needed: the rule dies with the connection below.
+      if (this._messageHandler) this.bus.off('message', this._messageHandler)
       try { this.bus.disconnect() } catch (e) { /* ignore */ }
     }
     this.bus = null
@@ -301,6 +311,7 @@ class BluezScanner extends EventEmitter {
     this.objectManager = null
     this._addedHandler = null
     this._removedHandler = null
+    this._messageHandler = null
     this._busErrorHandler = null
     this.devices.clear()
   }
@@ -334,42 +345,23 @@ class BluezScanner extends EventEmitter {
     return s
   }
 
-  async _watch(path) {
-    if (this.watchers.has(path)) return
-    // Claim the path before awaiting so a concurrent InterfacesAdded for
-    // the same path (startup race) can't register a second listener.
-    const entry = { propsIface: null, handler: null }
-    this.watchers.set(path, entry)
-    try {
-      const obj = await this.bus.getProxyObject('org.bluez', path)
-      if (this.watchers.get(path) !== entry) return // removed while awaiting
-      const propsIface = obj.getInterface('org.freedesktop.DBus.Properties')
-      entry.propsIface = propsIface
-      entry.handler = (iface, changed) => {
-        if (iface !== 'org.bluez.Device1') return
-        const u = unwrapAll(changed)
-        if (u.ManufacturerData !== undefined) {
-          u.ManufacturerData = unwrapMfgData(u.ManufacturerData)
-        }
-        const state = this._update(path, u)
-        // Only emit on advertisements that carry fresh manufacturer data
-        // (RSSI-only updates are noise here — the decoder needs payload).
-        if (u.ManufacturerData !== undefined) this._maybeEmit(state)
-      }
-      propsIface.on('PropertiesChanged', entry.handler)
-    } catch (e) {
-      if (this.watchers.get(path) === entry) this.watchers.delete(path)
-      this.logger.debug(`watch(${path}) failed: ${e.message}`)
+  // PropertiesChanged for any BlueZ object arrives here via the single
+  // PROPS_MATCH_RULE subscription. Only known devices are reported, so a
+  // signal racing InterfacesRemoved can't resurrect a removed device.
+  _onMessage(msg) {
+    if (msg.type !== MessageType.SIGNAL) return
+    if (msg.interface !== 'org.freedesktop.DBus.Properties' || msg.member !== 'PropertiesChanged') return
+    const [iface, changed] = msg.body || []
+    if (iface !== 'org.bluez.Device1') return
+    if (!this.devices.has(msg.path)) return
+    const u = unwrapAll(changed)
+    if (u.ManufacturerData !== undefined) {
+      u.ManufacturerData = unwrapMfgData(u.ManufacturerData)
     }
-  }
-
-  _unwatch(path) {
-    const entry = this.watchers.get(path)
-    if (!entry) return
-    this.watchers.delete(path)
-    if (entry.propsIface && entry.handler) {
-      entry.propsIface.off('PropertiesChanged', entry.handler)
-    }
+    const state = this._update(msg.path, u)
+    // Only emit on advertisements that carry fresh manufacturer data
+    // (RSSI-only updates are noise here — the decoder needs payload).
+    if (u.ManufacturerData !== undefined) this._maybeEmit(state)
   }
 
   _maybeEmit(state) {
