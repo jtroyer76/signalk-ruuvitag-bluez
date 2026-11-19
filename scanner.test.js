@@ -273,6 +273,28 @@ t('liveness timeout on quiet tags logs at info, not error', async () => {
   await s.stop()
 })
 
+t('a bus error during start() after stop() fails start(), not a reconnect', async () => {
+  const { logger } = silentLogger()
+  const s = new BluezScanner({ manufacturerId: RUUVI, logger })
+  busQueue.push(fakeSystemBus())
+  await s.start()
+  await s.stop()
+  assert.equal(s.established, false)
+
+  const gate = deferred()
+  const bus = fakeSystemBus({ gate: gate.promise })
+  busQueue.push(bus)
+  const starting = s.start()
+  await new Promise((r) => setImmediate(r)) // suspended in GetManagedObjects
+  bus.emit('error', new Error('bus dropped mid-connect'))
+  await new Promise((r) => setImmediate(r))
+  assert.equal(s.reconnecting, false)
+  assert.equal(s.reconnectTimer, null)
+  gate.resolve()
+  await starting
+  await s.stop()
+})
+
 let failed = 0
 ;(async () => {
   for (const { name, fn } of tests) {

@@ -99,6 +99,9 @@ class BluezScanner extends EventEmitter {
   async stop() {
     this.running = false
     this.reconnecting = false
+    // Otherwise a bus error during the next start()'s connect would pass the
+    // _handleDrop guard and be self-healed instead of failing start() loudly.
+    this.established = false
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer)
       this.reconnectTimer = null
