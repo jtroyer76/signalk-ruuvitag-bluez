@@ -17,6 +17,24 @@ jobs:
           node-version: '20'
           registry-url: https://registry.npmjs.org
           cache: npm
+      # Fail fast on a mistyped tag or a forgotten `npm version`, before
+      # anything is published.
+      - name: Check tag matches package.json version
+        run: |
+          expected="v$(node -p "require('./package.json').version")"
+          if [ "$GITHUB_REF_NAME" != "$expected" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match package.json version ($expected)"
+            exit 1
+          fi
+      # A pre-release version (x.y.z-rc.1) goes to the `next` dist-tag so
+      # it never becomes what `npm install` picks by default.
+      - name: Choose npm dist-tag
+        id: dist
+        run: |
+          case "$GITHUB_REF_NAME" in
+            *-*) echo "tag=next" >> "$GITHUB_OUTPUT" ;;
+            *)   echo "tag=latest" >> "$GITHUB_OUTPUT" ;;
+          esac
       # npm 11.5.1+ is required for trusted publishing. Node 20 ships with
       # npm 10.x, so upgrade before publishing. Provenance is automatic
       # under trusted publishing — no flag needed. Pinned to 11: npm 12
@@ -24,9 +42,10 @@ jobs:
       - run: npm install -g npm@11
       - run: npm ci
       - run: npm test
-      - run: npm publish --access public
+      - run: npm publish --access public --tag ${{ steps.dist.outputs.tag }}
       # Create a GitHub Release with auto-generated notes (commits + PRs
       # since the previous tag) only after the npm publish succeeded.
-      - run: gh release create "$GITHUB_REF_NAME" --generate-notes
+      - run: gh release create "$GITHUB_REF_NAME" --generate-notes $PRERELEASE
         env:
           GH_TOKEN: ${{ github.token }}
+          PRERELEASE: ${{ steps.dist.outputs.tag == 'next' && '--prerelease' || '' }}
