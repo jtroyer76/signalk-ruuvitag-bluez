@@ -5,9 +5,16 @@
 // DuplicateData=true, and re-emit each PropertiesChanged signal as an
 // 'advertisement' event filtered to a single manufacturer ID.
 //
+// Resilience: the scanner supervises its own connection. A dbus-level
+// error (system bus restart, socket drop) and a discovery stall (bluetoothd
+// restart, adapter reset — advertisements simply stop arriving) both funnel
+// into a single capped-backoff reconnect. Without this the plugin silently
+// stops delivering data until SignalK is restarted, and an unhandled bus
+// 'error' event could crash the server process.
+//
 // Events:
 //   'advertisement' { address, rssi, name, manufacturerData: Buffer }
-//   'started'       { adapterPath }
+//   'started'       { adapterPath }   (re-emitted on every reconnect)
 //   'stopped'
 //   'error'         Error
 //
@@ -20,6 +27,16 @@
 const EventEmitter = require('node:events')
 const dbus = require('dbus-next')
 const { Variant } = dbus
+
+const RECONNECT_BASE_MS = 1_000
+const RECONNECT_MAX_MS = 30_000
+// If no matching advertisement arrives for this long after we've seen at
+// least one, assume discovery stalled (bluetoothd restart / adapter reset)
+// and reconnect. Armed on the first sighting so an install with no tags in
+// range doesn't reconnect in a loop.
+const LIVENESS_TIMEOUT_MS = 60_000
+
+const nextReconnectDelay = (current) => Math.min(current * 2, RECONNECT_MAX_MS)
 
 const unwrap = (v) => (v && v.value !== undefined ? v.value : v)
 
@@ -51,43 +68,119 @@ class BluezScanner extends EventEmitter {
     this.adapterPath = null
     this.objectManager = null
     this.devices = new Map() // path -> { address, name, rssi, manufacturerData }
+    // path -> { propsIface, handler } (propsIface null while the proxy is
+    // still being fetched). dbus-next's getProxyObject() returns a fresh
+    // proxy every call and every .on() adds another listener on the shared
+    // bus, so watching a path twice doubles every advertisement. BlueZ
+    // drops and re-adds device objects as they go stale, so without this
+    // map listeners pile up for the life of the plugin.
+    this.watchers = new Map()
     this._addedHandler = null
+    this._removedHandler = null
+    this._busErrorHandler = null
+    // Supervision state.
+    this.running = false      // between start() and stop()
+    this.established = false   // a connection is currently live
+    this.reconnecting = false  // a reconnect loop is in flight
+    this.reconnectDelay = RECONNECT_BASE_MS
+    this.reconnectTimer = null
+    this.livenessTimer = null
   }
 
   async start() {
-    this.bus = dbus.systemBus()
+    this.running = true
+    this.reconnecting = false
+    this.reconnectDelay = RECONNECT_BASE_MS
+    // First connect fails loudly (SignalK marks the plugin errored); only
+    // drops after a successful connect are self-healed.
+    await this._establish()
+  }
 
-    const bluez = await this.bus.getProxyObject('org.bluez', '/')
-    this.objectManager = bluez.getInterface('org.freedesktop.DBus.ObjectManager')
-
-    const objects = await this.objectManager.GetManagedObjects()
-
-    for (const [path, ifaces] of Object.entries(objects)) {
-      if (ifaces['org.bluez.Adapter1']) {
-        this.adapterPath = path
-        break
-      }
+  async stop() {
+    this.running = false
+    this.reconnecting = false
+    // Otherwise a bus error during the next start()'s connect would pass the
+    // _handleDrop guard and be self-healed instead of failing start() loudly.
+    this.established = false
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = null
     }
-    if (!this.adapterPath) {
+    const wasActive = !!this.bus
+    await this._teardown()
+    if (wasActive) this.emit('stopped')
+  }
+
+  async _establish() {
+    const bus = dbus.systemBus()
+    this.bus = bus
+
+    // Attach before any awaits: an unhandled 'error' on the bus EventEmitter
+    // would otherwise throw and take down the server. Kept on the bus object
+    // for its whole life. dbus-next keeps emitting 'error' on a bus after
+    // disconnect(), so an error from a bus that has since been replaced must
+    // not tear down the current one.
+    this._busErrorHandler = (err) => {
+      if (bus !== this.bus) {
+        this.logger.debug(`dbus error on replaced connection: ${err.message}`)
+        return
+      }
+      this.logger.error(`dbus error: ${err.message}`)
+      this._handleDrop('BlueZ connection lost (dbus connection error); reconnecting')
+    }
+    this.bus.on('error', this._busErrorHandler)
+
+    try {
+      return await this._connect(bus)
+    } catch (e) {
+      // A run that stop()/start() superseded fails against its disconnected
+      // bus; its error belongs to nobody and must not tear down the new run.
+      if (bus !== this.bus) return false
+      throw e
+    }
+  }
+
+  // Bring `bus` up to an active discovery session. Returns false, leaving all
+  // state alone, if stop()/start() replaced `bus` while an await was pending
+  // (Signal K restarts plugins on config save, possibly mid-reconnect).
+  async _connect(bus) {
+    const superseded = () => bus !== this.bus
+
+    const bluez = await bus.getProxyObject('org.bluez', '/')
+    if (superseded()) return false
+    const objectManager = bluez.getInterface('org.freedesktop.DBus.ObjectManager')
+    this.objectManager = objectManager
+
+    const objects = await objectManager.GetManagedObjects()
+    if (superseded()) return false
+
+    const adapterPath = Object.keys(objects).find((path) => objects[path]['org.bluez.Adapter1'])
+    if (!adapterPath) {
       throw new Error('No BlueZ adapter found. Is bluetoothd running?')
     }
+    this.adapterPath = adapterPath
 
-    const adapterObj = await this.bus.getProxyObject('org.bluez', this.adapterPath)
-    this.adapter = adapterObj.getInterface('org.bluez.Adapter1')
+    const adapterObj = await bus.getProxyObject('org.bluez', adapterPath)
+    if (superseded()) return false
+    const adapter = adapterObj.getInterface('org.bluez.Adapter1')
+    this.adapter = adapter
     const adapterProps = adapterObj.getInterface('org.freedesktop.DBus.Properties')
 
     const powered = await adapterProps.Get('org.bluez.Adapter1', 'Powered')
+    if (superseded()) return false
     if (!unwrap(powered)) {
       this.logger.info('BlueZ adapter not powered, powering on')
       await adapterProps.Set('org.bluez.Adapter1', 'Powered', new Variant('b', true))
+      if (superseded()) return false
     }
 
     // DuplicateData=true: BlueZ emits a fresh PropertiesChanged for every
     // advertisement instead of deduplicating per-device.
-    await this.adapter.SetDiscoveryFilter({
+    await adapter.SetDiscoveryFilter({
       Transport: new Variant('s', 'le'),
       DuplicateData: new Variant('b', true),
     })
+    if (superseded()) return false
 
     this._addedHandler = async (path, ifaces) => {
       const dev = ifaces['org.bluez.Device1']
@@ -100,7 +193,14 @@ class BluezScanner extends EventEmitter {
       this._maybeEmit(state)
       await this._watch(path)
     }
-    this.objectManager.on('InterfacesAdded', this._addedHandler)
+    objectManager.on('InterfacesAdded', this._addedHandler)
+
+    this._removedHandler = (path, ifaces) => {
+      if (!ifaces.includes('org.bluez.Device1')) return
+      this._unwatch(path)
+      this.devices.delete(path)
+    }
+    objectManager.on('InterfacesRemoved', this._removedHandler)
 
     for (const [path, ifaces] of Object.entries(objects)) {
       if (!ifaces['org.bluez.Device1']) continue
@@ -110,34 +210,118 @@ class BluezScanner extends EventEmitter {
       }
       this._update(path, props)
       await this._watch(path)
+      if (superseded()) return false
     }
 
     try {
-      await this.adapter.StartDiscovery()
+      await adapter.StartDiscovery()
     } catch (e) {
       if (!/AlreadyExists|InProgress/i.test(e.message || '')) throw e
       this.logger.info('Discovery already running (another DBus client owns it) - continuing')
     }
+    if (superseded()) return false
 
-    this.emit('started', { adapterPath: this.adapterPath })
+    this.established = true
+    this.emit('started', { adapterPath })
+    return true
   }
 
-  async stop() {
-    if (!this.bus) return
-    try {
-      if (this.adapter) await this.adapter.StopDiscovery()
-    } catch (e) {
-      this.logger.debug(`StopDiscovery error: ${e.message}`)
+  // A connection drop or discovery stall was detected. Tear the current
+  // connection down and enter the reconnect loop. Guarded so overlapping
+  // triggers (bus error + liveness timeout) and stale old-bus errors during
+  // a reconnect don't stack loops.
+  async _handleDrop(message, level = 'error') {
+    if (!this.running || this.reconnecting || !this.established) return
+    this.reconnecting = true
+    this.established = false
+    this.logger[level](message)
+    this.reconnectDelay = RECONNECT_BASE_MS
+    await this._teardown()
+    this._scheduleReconnect()
+  }
+
+  _scheduleReconnect() {
+    if (!this.running) {
+      this.reconnecting = false
+      return
     }
-    if (this.objectManager && this._addedHandler) {
-      this.objectManager.off('InterfacesAdded', this._addedHandler)
+    this.logger.info(`reconnecting to BlueZ in ${Math.round(this.reconnectDelay / 1000)}s`)
+    this.reconnectTimer = setTimeout(async () => {
+      this.reconnectTimer = null
+      if (!this.running) {
+        this.reconnecting = false
+        return
+      }
+      try {
+        // Superseded by stop()/start(): the new run owns the state now.
+        if (!(await this._establish())) return
+        this.reconnectDelay = RECONNECT_BASE_MS
+        this.reconnecting = false
+        this.logger.info('reconnected to BlueZ')
+      } catch (e) {
+        this.logger.error(`reconnect failed: ${e.message}`)
+        await this._teardown()
+        this.reconnectDelay = nextReconnectDelay(this.reconnectDelay)
+        this._scheduleReconnect()
+      }
+    }, this.reconnectDelay)
+    if (this.reconnectTimer.unref) this.reconnectTimer.unref()
+  }
+
+  // Best-effort release of the current connection. Every step is guarded so
+  // it is safe to call on an already-dead bus (the drop case) and on a live
+  // one (the stop case). The bus 'error' listener is intentionally left on
+  // the (now dereferenced) bus so disconnect()-triggered errors don't throw;
+  // it is garbage-collected with the bus.
+  async _teardown() {
+    if (this.livenessTimer) {
+      clearTimeout(this.livenessTimer)
+      this.livenessTimer = null
     }
-    try { this.bus.disconnect() } catch (e) { /* ignore */ }
+    if (this.bus) {
+      try {
+        if (this.adapter) await this.adapter.StopDiscovery()
+      } catch (e) {
+        this.logger.debug(`StopDiscovery error: ${e.message}`)
+      }
+      if (this.objectManager && this._addedHandler) {
+        try { this.objectManager.off('InterfacesAdded', this._addedHandler) } catch (e) { /* ignore */ }
+      }
+      if (this.objectManager && this._removedHandler) {
+        try { this.objectManager.off('InterfacesRemoved', this._removedHandler) } catch (e) { /* ignore */ }
+      }
+      for (const path of [...this.watchers.keys()]) {
+        try { this._unwatch(path) } catch (e) { /* ignore */ }
+      }
+      try { this.bus.disconnect() } catch (e) { /* ignore */ }
+    }
     this.bus = null
     this.adapter = null
+    this.adapterPath = null
     this.objectManager = null
+    this._addedHandler = null
+    this._removedHandler = null
+    this._busErrorHandler = null
     this.devices.clear()
-    this.emit('stopped')
+  }
+
+  // (Re)arm the discovery-liveness watchdog. Called on every delivered
+  // advertisement, so the timer only exists once data has actually flowed.
+  _resetLiveness() {
+    if (this.livenessTimer) clearTimeout(this.livenessTimer)
+    if (!this.running) return
+    this.livenessTimer = setTimeout(() => this._onLivenessTimeout(), LIVENESS_TIMEOUT_MS)
+    if (this.livenessTimer.unref) this.livenessTimer.unref()
+  }
+
+  // Silence is ambiguous: a stalled discovery looks the same as every tag
+  // being out of range, asleep or on a flat battery, so this is not logged
+  // as a connection failure.
+  _onLivenessTimeout() {
+    return this._handleDrop(
+      `no advertisements for ${LIVENESS_TIMEOUT_MS / 1000}s; restarting discovery`,
+      'info',
+    )
   }
 
   _update(path, props) {
@@ -151,10 +335,17 @@ class BluezScanner extends EventEmitter {
   }
 
   async _watch(path) {
+    if (this.watchers.has(path)) return
+    // Claim the path before awaiting so a concurrent InterfacesAdded for
+    // the same path (startup race) can't register a second listener.
+    const entry = { propsIface: null, handler: null }
+    this.watchers.set(path, entry)
     try {
       const obj = await this.bus.getProxyObject('org.bluez', path)
+      if (this.watchers.get(path) !== entry) return // removed while awaiting
       const propsIface = obj.getInterface('org.freedesktop.DBus.Properties')
-      propsIface.on('PropertiesChanged', (iface, changed) => {
+      entry.propsIface = propsIface
+      entry.handler = (iface, changed) => {
         if (iface !== 'org.bluez.Device1') return
         const u = unwrapAll(changed)
         if (u.ManufacturerData !== undefined) {
@@ -164,9 +355,20 @@ class BluezScanner extends EventEmitter {
         // Only emit on advertisements that carry fresh manufacturer data
         // (RSSI-only updates are noise here — the decoder needs payload).
         if (u.ManufacturerData !== undefined) this._maybeEmit(state)
-      })
+      }
+      propsIface.on('PropertiesChanged', entry.handler)
     } catch (e) {
+      if (this.watchers.get(path) === entry) this.watchers.delete(path)
       this.logger.debug(`watch(${path}) failed: ${e.message}`)
+    }
+  }
+
+  _unwatch(path) {
+    const entry = this.watchers.get(path)
+    if (!entry) return
+    this.watchers.delete(path)
+    if (entry.propsIface && entry.handler) {
+      entry.propsIface.off('PropertiesChanged', entry.handler)
     }
   }
 
@@ -174,6 +376,7 @@ class BluezScanner extends EventEmitter {
     if (!state.manufacturerData) return
     const data = state.manufacturerData[this.manufacturerId]
     if (!data) return
+    this._resetLiveness()
     this.emit('advertisement', {
       address: state.address || null,
       name: state.name || null,
@@ -183,4 +386,4 @@ class BluezScanner extends EventEmitter {
   }
 }
 
-module.exports = { BluezScanner }
+module.exports = { BluezScanner, nextReconnectDelay }
