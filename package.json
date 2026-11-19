@@ -1,7 +1,7 @@
 {
   "name": "signalk-ruuvitag-bluez",
-  "version": "1.0.4",
-  "description": "SignalK plugin: RuuviTag environmental data via BlueZ over DBus. Drop-in replacement for signalk-ruuvitag-plugin without noble, raw HCI sockets, setcap, or privileged Docker.",
+  "version": "1.1.0",
+  "description": "Signal K plugin: RuuviTag data via BlueZ over D-Bus. Drop-in replacement for signalk-ruuvitag-plugin without noble, raw HCI sockets, setcap or privileged Docker; coexists with other Bluetooth plugins and recovers from bluetoothd restarts.",
   "main": "index.js",
   "scripts": {
     "test": "node decoder.test.js && node index.test.js && node scanner.test.js"
