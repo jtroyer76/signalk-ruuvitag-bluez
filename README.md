@@ -9,7 +9,7 @@ It is a drop-in alternative to
 [`signalk-ruuvitag-plugin`](https://github.com/vokkim/signalk-ruuvitag-plugin)
 (by Mikko Vesikkala / @vokkim) for the same hardware, with the same
 SignalK paths, designed to coexist with other BlueZ users such as
-[`signalk-victron-ble`](https://github.com/sbender9/signalk-victron-ble).
+[`signalk-victron-ble`](https://github.com/stefanor/signalk-victron-ble).
 
 ## Why a different plugin?
 
