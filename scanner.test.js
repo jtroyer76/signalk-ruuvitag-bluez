@@ -1,9 +1,9 @@
-// Tests for BluezScanner's per-device watch bookkeeping and its reconnect
-// supervision. dbus-next hands out a fresh proxy on every getProxyObject()
-// call and fans each signal out to every listener on the bus, so watching a
-// path twice doubles every advertisement; the fake bus below reproduces that
-// fan-out. The real D-Bus I/O needs a live system bus + bluetoothd and is
-// exercised on-device.
+// Tests for BluezScanner's signal routing and its reconnect supervision.
+// The fake system bus below stands in for dbus-next: it records AddMatch
+// calls and delivers PropertiesChanged as raw 'message' events, the way
+// the scanner's single path_namespace subscription receives them. The
+// real D-Bus I/O needs a live system bus + bluetoothd and is exercised
+// on-device.
 // Run with: node scanner.test.js
 
 'use strict'
@@ -13,58 +13,32 @@ const EventEmitter = require('node:events')
 const { BluezScanner, nextReconnectDelay } = require('./scanner')
 
 const RUUVI = 0x0499
+const ADAPTER = '/org/bluez/hci0'
 const PATH = '/org/bluez/hci0/dev_C2_64_6B_F3_E6_EB'
-
-// Every proxy for a path shares one signal emitter, like dbus-next's
-// bus._signals. .off() on any proxy removes only that proxy's handler.
-function fakeBus() {
-  const signals = new Map() // path -> EventEmitter
-  const bus = {
-    getProxyObject: async (_name, path) => {
-      if (!signals.has(path)) signals.set(path, new EventEmitter())
-      const shared = signals.get(path)
-      return {
-        getInterface: () => ({
-          on: (ev, fn) => shared.on(ev, fn),
-          off: (ev, fn) => shared.off(ev, fn),
-        }),
-      }
-    },
-    signal: (path, ...args) => signals.get(path).emit('PropertiesChanged', ...args),
-    listeners: (path) => (signals.has(path) ? signals.get(path).listenerCount('PropertiesChanged') : 0),
-  }
-  return bus
-}
-
-function scannerWithBus() {
-  const scanner = new BluezScanner({ manufacturerId: RUUVI })
-  scanner.bus = fakeBus()
-  return scanner
-}
+const SIGNAL = 4 // dbus-next MessageType.SIGNAL
 
 const mfgChange = () => ({
   ManufacturerData: { value: { [RUUVI]: { value: [5, 1, 2, 3] } } },
 })
+const device = (address) => ({ 'org.bluez.Device1': { Address: { value: address } } })
 
-const ADAPTER = '/org/bluez/hci0'
-
-// A system bus that _establish() can run against end to end. Device paths
-// delegate to fakeBus() so PropertiesChanged fan-out behaves the same.
-// `gate`, if given, holds GetManagedObjects() until it resolves, leaving
-// an _establish() suspended mid-flight.
-function fakeSystemBus({ gate } = {}) {
-  const devices = fakeBus()
+// A system bus that _establish() can run against end to end. `devices`
+// seeds GetManagedObjects() with path -> ifaces. `gate`, if given, holds
+// GetManagedObjects() until it resolves, leaving an _establish()
+// suspended mid-flight.
+function fakeSystemBus({ gate, devices = {} } = {}) {
   const bus = new EventEmitter()
   const objectManager = new EventEmitter()
   bus.objectManager = objectManager
   bus.startDiscoveryCalls = 0
+  bus.addMatches = []
   bus.disconnected = false
   const omIface = {
     on: (ev, fn) => objectManager.on(ev, fn),
     off: (ev, fn) => objectManager.off(ev, fn),
     GetManagedObjects: async () => {
       if (gate) await gate
-      return { [ADAPTER]: { 'org.bluez.Adapter1': {} } }
+      return { [ADAPTER]: { 'org.bluez.Adapter1': {} }, ...devices }
     },
   }
   const adapterIface = {
@@ -73,15 +47,24 @@ function fakeSystemBus({ gate } = {}) {
     StopDiscovery: async () => {},
   }
   const adapterProps = { Get: async () => ({ value: true }), Set: async () => {} }
-  bus.getProxyObject = async (name, path) => {
+  bus.getProxyObject = async (_name, path) => {
     if (path === '/') return { getInterface: () => omIface }
     if (path === ADAPTER) {
       return { getInterface: (i) => (i === 'org.bluez.Adapter1' ? adapterIface : adapterProps) }
     }
-    return devices.getProxyObject(name, path)
+    throw new Error(`unexpected per-device proxy for ${path}`)
   }
+  bus.call = async (msg) => {
+    if (msg.member === 'AddMatch') bus.addMatches.push(msg.body[0])
+  }
+  bus.signal = (path, iface, changed) => bus.emit('message', {
+    type: SIGNAL,
+    path,
+    interface: 'org.freedesktop.DBus.Properties',
+    member: 'PropertiesChanged',
+    body: [iface, changed, []],
+  })
   bus.disconnect = () => { bus.disconnected = true }
-  bus.devices = devices
   return bus
 }
 
@@ -112,49 +95,84 @@ const deferred = () => {
   return { promise, resolve }
 }
 
+// A started scanner on a fresh fake bus, counting advertisements.
+async function startedScanner(opts) {
+  const { logger } = silentLogger()
+  const s = new BluezScanner({ manufacturerId: RUUVI, logger })
+  const bus = fakeSystemBus(opts)
+  busQueue.push(bus)
+  await s.start()
+  const adverts = []
+  s.on('advertisement', (a) => adverts.push(a))
+  return { s, bus, adverts }
+}
+
 const tests = []
 const t = (name, fn) => tests.push({ name, fn })
 
-t('_watch: same path twice registers one listener', async () => {
-  const s = scannerWithBus()
-  await s._watch(PATH)
-  await s._watch(PATH)
-  assert.equal(s.bus.listeners(PATH), 1)
+t('one path_namespace AddMatch covers every device', async () => {
+  const devices = {}
+  for (let i = 0; i < 50; i++) devices[`${ADAPTER}/dev_00_00_00_00_00_${String(i).padStart(2, '0')}`] = device(`00:${i}`)
+  const { s, bus } = await startedScanner({ devices })
+  assert.equal(bus.addMatches.length, 1)
+  assert.match(bus.addMatches[0], /member='PropertiesChanged'/)
+  assert.match(bus.addMatches[0], /path_namespace='\/org\/bluez'/)
+  assert.match(bus.addMatches[0], /sender='org.bluez'/)
+  await s.stop()
 })
 
-t('_watch: concurrent calls for same path register one listener', async () => {
-  const s = scannerWithBus()
-  await Promise.all([s._watch(PATH), s._watch(PATH), s._watch(PATH)])
-  assert.equal(s.bus.listeners(PATH), 1)
-})
-
-t('one signal produces one advertisement after repeated watches', async () => {
-  const s = scannerWithBus()
-  await s._watch(PATH)
-  await s._watch(PATH)
-  let n = 0
-  s.on('advertisement', () => n++)
-  s.bus.signal(PATH, 'org.bluez.Device1', mfgChange())
-  assert.equal(n, 1)
-})
-
-t('_unwatch then re-watch (BlueZ remove/re-add) keeps one listener', async () => {
-  const s = scannerWithBus()
-  for (let i = 0; i < 5; i++) {
-    await s._watch(PATH)
-    s._unwatch(PATH)
+t('BlueZ remove/re-add churn adds no match rules', async () => {
+  const { s, bus } = await startedScanner()
+  for (let i = 0; i < 1000; i++) {
+    bus.objectManager.emit('InterfacesAdded', PATH, device('C2:64:6B:F3:E6:EB'))
+    bus.objectManager.emit('InterfacesRemoved', PATH, ['org.bluez.Device1'])
   }
-  await s._watch(PATH)
-  assert.equal(s.bus.listeners(PATH), 1)
+  assert.equal(bus.addMatches.length, 1)
+  await s.stop()
 })
 
-t('_unwatch during pending _watch does not leave a listener', async () => {
-  const s = scannerWithBus()
-  const p = s._watch(PATH)
-  s._unwatch(PATH)
-  await p
-  assert.equal(s.bus.listeners(PATH), 0)
-  assert.equal(s.watchers.size, 0)
+t('PropertiesChanged with manufacturer data emits one advertisement', async () => {
+  const { s, bus, adverts } = await startedScanner({ devices: { [PATH]: device('C2:64:6B:F3:E6:EB') } })
+  bus.signal(PATH, 'org.bluez.Device1', mfgChange())
+  assert.equal(adverts.length, 1)
+  assert.equal(adverts[0].address, 'C2:64:6B:F3:E6:EB')
+  assert.deepEqual([...adverts[0].manufacturerData], [5, 1, 2, 3])
+  await s.stop()
+})
+
+t('RSSI-only, other-interface and unknown-device signals are ignored', async () => {
+  const { s, bus, adverts } = await startedScanner({ devices: { [PATH]: device('C2:64:6B:F3:E6:EB') } })
+  bus.signal(PATH, 'org.bluez.Device1', { RSSI: { value: -60 } })
+  bus.signal(PATH, 'org.bluez.Battery1', mfgChange())
+  bus.signal(`${ADAPTER}/dev_AA_AA_AA_AA_AA_AA`, 'org.bluez.Device1', mfgChange())
+  assert.equal(adverts.length, 0)
+  assert.equal(s.devices.get(PATH).rssi, -60)
+  await s.stop()
+})
+
+t('a removed device stays removed if a late signal arrives', async () => {
+  const { s, bus, adverts } = await startedScanner({ devices: { [PATH]: device('C2:64:6B:F3:E6:EB') } })
+  bus.objectManager.emit('InterfacesRemoved', PATH, ['org.bluez.Device1'])
+  bus.signal(PATH, 'org.bluez.Device1', mfgChange())
+  assert.equal(adverts.length, 0)
+  assert.equal(s.devices.has(PATH), false)
+  await s.stop()
+})
+
+t('a device added at runtime is routed', async () => {
+  const { s, bus, adverts } = await startedScanner()
+  bus.objectManager.emit('InterfacesAdded', PATH, device('C2:64:6B:F3:E6:EB'))
+  bus.signal(PATH, 'org.bluez.Device1', mfgChange())
+  assert.equal(adverts.length, 1)
+  await s.stop()
+})
+
+t('teardown detaches the message handler from the old bus', async () => {
+  const { s, bus, adverts } = await startedScanner({ devices: { [PATH]: device('C2:64:6B:F3:E6:EB') } })
+  await s.stop()
+  assert.equal(bus.listenerCount('message'), 0)
+  bus.signal(PATH, 'org.bluez.Device1', mfgChange())
+  assert.equal(adverts.length, 0)
 })
 
 t('nextReconnectDelay: doubles each step', () => {
@@ -206,18 +224,6 @@ t('a drop after establish schedules one reconnect; stop() cancels it', async () 
   assert.equal(s.reconnectTimer, null)
 })
 
-t('_teardown forgets watchers so the next bus watches every path again', async () => {
-  const s = scannerWithBus()
-  await s._watch(PATH)
-  s.bus.disconnect = () => {}
-  await s._teardown()
-  assert.equal(s.watchers.size, 0)
-
-  s.bus = fakeBus()
-  await s._watch(PATH)
-  assert.equal(s.bus.listeners(PATH), 1)
-})
-
 t('a late error from a replaced bus does not tear down the live one', async () => {
   const { logger } = silentLogger()
   const s = new BluezScanner({ manufacturerId: RUUVI, logger })
@@ -257,6 +263,9 @@ t('stop()/start() during an in-flight _establish leaves one run on the new bus',
   assert.equal(s.established, true)
   assert.equal(liveBus.objectManager.listenerCount('InterfacesAdded'), 1)
   assert.equal(liveBus.objectManager.listenerCount('InterfacesRemoved'), 1)
+  assert.equal(liveBus.listenerCount('message'), 1)
+  assert.equal(staleBus.listenerCount('message'), 0)
+  assert.equal(liveBus.addMatches.length, 1)
   assert.equal(staleBus.startDiscoveryCalls, 0)
   assert.equal(liveBus.startDiscoveryCalls, 1)
   await s.stop()
